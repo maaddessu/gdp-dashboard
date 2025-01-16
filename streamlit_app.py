@@ -7,8 +7,14 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 #######################################
-# 1. SET UP REDDIT & FETCH POSTS
+# 1. STREAMLIT SETUP & USER INPUT
 #######################################
+
+st.title("Migration Patterns Analysis")
+
+# User input for subreddit and number of posts
+subreddit_name = st.text_input("Enter subreddit name:", "IWantOut")
+num_posts = st.number_input("Number of posts to fetch:", min_value=10, max_value=500, value=100, step=10)
 
 # Replace with your own credentials from https://www.reddit.com/prefs/apps
 reddit = praw.Reddit(
@@ -17,35 +23,28 @@ reddit = praw.Reddit(
     user_agent="YOUR_USER_AGENT"
 )
 
-# Parameters
-subreddit_name = "IWantOut"  # Example subreddit, replace with your choice
-num_posts = 10  # Number of posts to fetch
-comment_limit = 1  # Number of top comments per post
+#######################################
+# 2. FETCH REDDIT POSTS
+#######################################
 
 all_data = []
+st.write(f"Fetching {num_posts} posts from subreddit: {subreddit_name}...")
 
-# Fetch posts and comments
-subreddit = reddit.subreddit(subreddit_name)
-for submission in subreddit.hot(limit=num_posts):
-    title = submission.title
-    submission.comments.replace_more(limit=0)
+try:
+    subreddit = reddit.subreddit(subreddit_name)
+    for submission in subreddit.hot(limit=num_posts):
+        title = submission.title
+        all_data.append({"post_title": title})
 
-    count = 0
-    for comment in submission.comments.list():
-        if hasattr(comment, "body"):
-            all_data.append({
-                "post_title": title
-            })
-            count += 1
-            if count >= comment_limit:
-                break
+    st.success("Posts fetched successfully!")
+except Exception as e:
+    st.error(f"Failed to fetch posts: {e}")
 
 #######################################
-# 2. TEXT PROCESSING & COUNTRY EXTRACTION
+# 3. TEXT PROCESSING & COUNTRY EXTRACTION
 #######################################
 
 filtered_data = []
-
 for item in all_data:
     text = item["post_title"].lower()  # Lowercase text
     text = re.sub(r"http\S+", "", text)  # Remove URLs
@@ -60,13 +59,13 @@ for item in all_data:
         item["desired_country"] = arrow_match.group(2)  # Country after the arrow
         filtered_data.append(item)  # Only include posts with a valid arrow match
 
-
 # Convert to DataFrame
 df = pd.DataFrame(filtered_data)
-print(df)
+st.write("Extracted migration data:")
+st.dataframe(df)
 
 #######################################
-# 3. COUNT OCCURRENCES & FETCH GDP DATA
+# 4. COUNT OCCURRENCES & FETCH GDP DATA
 #######################################
 
 # Count occurrences of current and desired countries
@@ -81,31 +80,49 @@ country_mentions = pd.merge(current_counts, desired_counts, on="country", how="o
 
 # Fetch GDP per capita data from World Bank API
 gdp_data = wbdata.get_data("NY.GDP.PCAP.CD")  # Fetch all available data for GDP per capita
-gdp_df = pd.DataFrame([ 
-    {"country": entry["country"]["value"], "gdp_per_capita": entry["value"]} 
+gdp_df = pd.DataFrame([
+    {"country": entry["country"]["value"], "gdp_per_capita": entry["value"]}
     for entry in gdp_data if entry["value"] is not None
 ])
 
-# Fuzzy match country names
+# Fuzzy match country names using thefuzz
 matched_countries = []
 for country in country_mentions["country"]:
-    match = process.extractOne(country, gdp_df["country"])
-    matched_countries.append((country, match[0], match[1] if match else 0))
+    match = process.extractOne(country, gdp_df["country"], score_cutoff=80)  # Adjust score_cutoff as needed
+    if match:
+        matched_countries.append((country, match[0], match[1]))
+    else:
+        matched_countries.append((country, None, 0))
 
 matched_df = pd.DataFrame(matched_countries, columns=["country", "matched_country", "score"])
 matched_gdp = pd.merge(country_mentions, matched_df, on="country")
 matched_gdp = pd.merge(matched_gdp, gdp_df, left_on="matched_country", right_on="country", suffixes=("", "_gdp")).drop(columns=["country_gdp"])
 
 #######################################
-# 4. CREATE SCATTERPLOTS IN STREAMLIT
+# 5. FINAL DATAFRAME
 #######################################
 
-st.title("Migration Patterns Analysis")
+# Group by matched_country and aggregate values
+final_df = matched_gdp.groupby("matched_country").agg({
+    "leaving_mentions": "sum",
+    "moving_mentions": "sum",
+    "gdp_per_capita": "mean"  # Average GDP per capita if duplicates exist
+}).reset_index()
+
+# Rename columns for clarity
+final_df.rename(columns={"matched_country": "country"}, inplace=True)
+
+st.write("Final Data:")
+st.dataframe(final_df)
+
+#######################################
+# 6. PLOT DATA IN STREAMLIT
+#######################################
 
 # Scatterplot: Origin countries vs GDP
 st.subheader("GDP per Capita vs Leaving Mentions")
 fig, ax = plt.subplots(figsize=(10, 6))
-ax.scatter(matched_gdp["gdp_per_capita"], matched_gdp["leaving_mentions"], alpha=0.7)
+ax.scatter(final_df["gdp_per_capita"], final_df["leaving_mentions"], alpha=0.7)
 ax.set_title("GDP per Capita vs Leaving Mentions")
 ax.set_xlabel("GDP per Capita")
 ax.set_ylabel("Leaving Mentions")
@@ -115,7 +132,7 @@ st.pyplot(fig)
 # Scatterplot: Destination countries vs GDP
 st.subheader("GDP per Capita vs Moving Mentions")
 fig, ax = plt.subplots(figsize=(10, 6))
-ax.scatter(matched_gdp["gdp_per_capita"], matched_gdp["moving_mentions"], alpha=0.7, color="orange")
+ax.scatter(final_df["gdp_per_capita"], final_df["moving_mentions"], alpha=0.7, color="orange")
 ax.set_title("GDP per Capita vs Moving Mentions")
 ax.set_xlabel("GDP per Capita")
 ax.set_ylabel("Moving Mentions")
@@ -123,12 +140,13 @@ ax.grid()
 st.pyplot(fig)
 
 #######################################
-# 5. DISPLAY DATA & EXPORT BUTTON
+# 7. EXPORT DATAFRAME
 #######################################
 
-st.subheader("Data Preview")
-st.dataframe(matched_gdp)
-
-# Download CSV button
-csv = matched_gdp.to_csv(index=False)
-st.download_button(label="Download Data as CSV", data=csv, file_name="country_mentions_gdp.csv", mime="text/csv")
+csv = final_df.to_csv(index=False)
+st.download_button(
+    label="Download Data as CSV",
+    data=csv,
+    file_name="migration_analysis.csv",
+    mime="text/csv"
+)
