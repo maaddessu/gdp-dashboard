@@ -19,7 +19,7 @@ reddit = praw.Reddit(
 
 # Parameters
 subreddit_name = "IWantOut"  # Example subreddit, replace with your choice
-num_posts = 100  # Number of posts to fetch
+num_posts = 10  # Number of posts to fetch
 comment_limit = 1  # Number of top comments per post
 
 all_data = []
