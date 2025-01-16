@@ -1,151 +1,132 @@
-import streamlit as st
+import praw
+import re
 import pandas as pd
-import math
-from pathlib import Path
+from thefuzz import process  # Updated to use thefuzz
+import wbdata
+import matplotlib.pyplot as plt
+import streamlit as st
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+#######################################
+# 1. SET UP REDDIT & FETCH POSTS
+#######################################
+
+# Replace with your own credentials from https://www.reddit.com/prefs/apps
+reddit = praw.Reddit(
+    client_id="wqQzEhvlInEto5FqaqTNBw",
+    client_secret="492s5Fif0p1uI29RxisIgCLJbzqLPQ",
+    user_agent="YOUR_USER_AGENT"
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Parameters
+subreddit_name = "IWantOut"  # Example subreddit, replace with your choice
+num_posts = 10  # Number of posts to fetch
+comment_limit = 1  # Number of top comments per post
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+all_data = []
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Fetch posts and comments
+subreddit = reddit.subreddit(subreddit_name)
+for submission in subreddit.hot(limit=num_posts):
+    title = submission.title
+    submission.comments.replace_more(limit=0)
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    count = 0
+    for comment in submission.comments.list():
+        if hasattr(comment, "body"):
+            all_data.append({
+                "post_title": title
+            })
+            count += 1
+            if count >= comment_limit:
+                break
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+#######################################
+# 2. TEXT PROCESSING & COUNTRY EXTRACTION
+#######################################
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+filtered_data = []
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+for item in all_data:
+    text = item["post_title"].lower()  # Lowercase text
+    text = re.sub(r"http\S+", "", text)  # Remove URLs
+    text = re.sub(r"[^a-zA-Z0-9\s\->]", "", text)  # Keep alphanumeric characters, spaces, and "->"
+    text = re.sub(r"\s+", " ", text).strip()  # Remove extra whitespace
+    item["cleaned_comment"] = text
 
-    return gdp_df
+    # Regex to extract countries before and after the arrow
+    arrow_match = re.search(r"([a-zA-Z]+)\s*->\s*([a-zA-Z]+)", text)
+    if arrow_match:
+        item["current_country"] = arrow_match.group(1)  # Country before the arrow
+        item["desired_country"] = arrow_match.group(2)  # Country after the arrow
+        filtered_data.append(item)  # Only include posts with a valid arrow match
 
-gdp_df = get_gdp_data()
+# Convert to DataFrame
+df = pd.DataFrame(filtered_data)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+#######################################
+# 3. COUNT OCCURRENCES & FETCH GDP DATA
+#######################################
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+# Count occurrences of current and desired countries
+current_counts = df["current_country"].value_counts().reset_index()
+current_counts.columns = ["country", "leaving_mentions"]
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source
-'''
+desired_counts = df["desired_country"].value_counts().reset_index()
+desired_counts.columns = ["country", "moving_mentions"]
 
-# Add some spacing
-''
-''
+# Merge leaving and moving mentions
+country_mentions = pd.merge(current_counts, desired_counts, on="country", how="outer").fillna(0)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+# Fetch GDP per capita data from World Bank API
+gdp_data = wbdata.get_data("NY.GDP.PCAP.CD")  # Fetch all available data for GDP per capita
+gdp_df = pd.DataFrame([ 
+    {"country": entry["country"]["value"], "gdp_per_capita": entry["value"]} 
+    for entry in gdp_data if entry["value"] is not None
+])
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+# Fuzzy match country names
+matched_countries = []
+for country in country_mentions["country"]:
+    match = process.extractOne(country, gdp_df["country"])
+    matched_countries.append((country, match[0], match[1] if match else 0))
 
-countries = gdp_df['Country Code'].unique()
+matched_df = pd.DataFrame(matched_countries, columns=["country", "matched_country", "score"])
+matched_gdp = pd.merge(country_mentions, matched_df, on="country")
+matched_gdp = pd.merge(matched_gdp, gdp_df, left_on="matched_country", right_on="country", suffixes=("", "_gdp")).drop(columns=["country_gdp"])
 
-if not len(countries):
-    st.warning("Select at least one country")
+#######################################
+# 4. CREATE SCATTERPLOTS IN STREAMLIT
+#######################################
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+st.title("Migration Patterns Analysis")
 
-''
-''
-''
+# Scatterplot: Origin countries vs GDP
+st.subheader("GDP per Capita vs Leaving Mentions")
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.scatter(matched_gdp["gdp_per_capita"], matched_gdp["leaving_mentions"], alpha=0.7)
+ax.set_title("GDP per Capita vs Leaving Mentions")
+ax.set_xlabel("GDP per Capita")
+ax.set_ylabel("Leaving Mentions")
+ax.grid()
+st.pyplot(fig)
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+# Scatterplot: Destination countries vs GDP
+st.subheader("GDP per Capita vs Moving Mentions")
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.scatter(matched_gdp["gdp_per_capita"], matched_gdp["moving_mentions"], alpha=0.7, color="orange")
+ax.set_title("GDP per Capita vs Moving Mentions")
+ax.set_xlabel("GDP per Capita")
+ax.set_ylabel("Moving Mentions")
+ax.grid()
+st.pyplot(fig)
 
-st.header('GDP over time', divider='gray')
+#######################################
+# 5. DISPLAY DATA & EXPORT BUTTON
+#######################################
 
-''
+st.subheader("Data Preview")
+st.dataframe(matched_gdp)
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# Download CSV button
+csv = matched_gdp.to_csv(index=False)
+st.download_button(label="Download Data as CSV", data=csv, file_name="country_mentions_gdp.csv", mime="text/csv")
