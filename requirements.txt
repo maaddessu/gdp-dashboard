@@ -1,2 +1,8 @@
-streamlit
+praw
+re
 pandas
+thefuzz
+wbdata
+matplotlib.pyplot
+streamlit
+
