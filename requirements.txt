@@ -2,6 +2,6 @@ praw
 pandas
 thefuzz
 wbdata
-matplotlib.pyplot
+matplotlib
 streamlit
 
