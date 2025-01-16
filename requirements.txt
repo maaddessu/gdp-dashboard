@@ -1,5 +1,4 @@
 praw
-re
 pandas
 thefuzz
 wbdata
